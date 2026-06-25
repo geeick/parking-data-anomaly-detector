@@ -1,11 +1,51 @@
 import argparse
+import csv
 import os
 import re
+from typing import Iterable, List, Optional
+
 import pandas as pd
 
 
+DETECTOR_VERSION = "2026-06-25-v4-csv-reader-no-duplicate-exit-deadperiod"
+
+
+ANOMALY_COLUMNS = [
+    "row_number",
+    "related_row_numbers",
+    "location",
+    "ticket_id",
+    "severity",
+    "anomaly_type",
+    "description",
+    "suggested_fix",
+]
+
+
+EXPECTED_HEADERS = [
+    "Location",
+    "Ticket#",
+    "License Plate No.",
+    "Amount",
+    "Tax",
+    "Fee",
+    "Per Day Fee",
+    "Duration(hh:mm)",
+    "Entry Time",
+    "Exit Time",
+    "Transaction Time",
+    "Ticket Status",
+    "Transaction Mode",
+    "Ticket Type",
+    "Transaction Description",
+    "Payment Status",
+    "Extended By",
+    "Reason",
+]
+
+
 def normalize_column_name(col):
-    col = col.strip().lower()
+    col = str(col).strip().lower()
     col = re.sub(r"[^a-z0-9]+", "_", col)
     return col.strip("_")
 
@@ -38,7 +78,8 @@ def parse_duration_to_hours(value):
     01:30
     1h
     1.5
-    Returns NaN for values like 'Until 11 PM'.
+
+    Returns None for values like 'Until 11 PM'.
     """
     if pd.isna(value):
         return None
@@ -51,7 +92,14 @@ def parse_duration_to_hours(value):
     if "until" in text:
         return None
 
-    text = text.replace("hours", "").replace("hour", "").replace("hrs", "").replace("hr", "").replace("h", "").strip()
+    text = (
+        text.replace("hours", "")
+        .replace("hour", "")
+        .replace("hrs", "")
+        .replace("hr", "")
+        .replace("h", "")
+        .strip()
+    )
 
     if ":" in text:
         parts = text.split(":")
@@ -68,20 +116,50 @@ def parse_duration_to_hours(value):
     except ValueError:
         return None
 
+
+def _parse_csv_line(line: str, delimiter: str) -> List[str]:
+    """Parse one report row using csv.reader so quoted commas are handled correctly."""
+    return next(
+        csv.reader(
+            [line],
+            delimiter=delimiter,
+            quotechar='"',
+            skipinitialspace=False,
+        )
+    )
+
+
+def _find_header_row(lines: List[str]):
+    """Return (header_index, delimiter, headers)."""
+    delimiters_to_try = ["\t", ","]
+
+    for i, line in enumerate(lines):
+        for delimiter in delimiters_to_try:
+            try:
+                cells = [cell.strip() for cell in _parse_csv_line(line, delimiter)]
+            except csv.Error:
+                continue
+
+            if len(cells) >= 2 and cells[0] == "Location" and cells[1].startswith("Ticket"):
+                while cells and cells[-1] == "":
+                    cells.pop()
+                return i, delimiter, cells
+
+    raise ValueError(
+        "Could not find the real header row. Expected a row starting with Location and Ticket#."
+    )
+
+
 def read_parking_report(input_csv):
     """
-    Reads SafetyPark-style parking reports without using pandas' CSV parser.
+    Reads SafetyPark-style parking reports.
 
-    SafetyPark exports look like this:
-    - Line 1: report title/date range
-    - Line 2: actual column headers
-    - Line 3+: transaction rows
-    - Columns are tab-separated
-
-    This manual reader avoids pandas quote/parsing errors from messy real-world
-    report rows. It also preserves the original report line number for each row.
+    Supported formats:
+    - First line may be a report title/date range.
+    - A later line contains the actual headers starting with Location and Ticket#.
+    - Rows may be tab-separated or comma-separated.
+    - Quoted commas inside fields, such as "5 Dudley ave, Venice", are handled correctly.
     """
-
     encodings_to_try = ["utf-8-sig", "utf-8", "cp1252"]
     lines = None
     last_error = None
@@ -97,36 +175,7 @@ def read_parking_report(input_csv):
     if lines is None:
         raise ValueError(f"Could not read file. Last error: {last_error}")
 
-    header_index = None
-    delimiter = "\t"
-
-    # Find the actual header row instead of assuming it is line 2.
-    # This keeps the script working even if the export includes extra title rows.
-    for i, line in enumerate(lines):
-        tab_cells = [cell.strip() for cell in line.split("\t")]
-        comma_cells = [cell.strip() for cell in line.split(",")]
-
-        if len(tab_cells) >= 2 and tab_cells[0] == "Location" and tab_cells[1].startswith("Ticket"):
-            header_index = i
-            delimiter = "\t"
-            break
-
-        if len(comma_cells) >= 2 and comma_cells[0] == "Location" and comma_cells[1].startswith("Ticket"):
-            header_index = i
-            delimiter = ","
-            break
-
-    if header_index is None:
-        raise ValueError(
-            "Could not find the real header row. "
-            "Expected a row starting with Location and Ticket#."
-        )
-
-    headers = [header.strip() for header in lines[header_index].split(delimiter)]
-
-    # Remove blank columns caused by trailing tabs/commas.
-    while headers and headers[-1] == "":
-        headers.pop()
+    header_index, delimiter, headers = _find_header_row(lines)
 
     if not headers:
         raise ValueError("Found a header row, but it did not contain any usable columns.")
@@ -134,59 +183,114 @@ def read_parking_report(input_csv):
     rows = []
     malformed_rows = []
 
-    # Real report line numbers are 1-based.
-    for source_line_number, line in enumerate(lines[header_index + 1:], start=header_index + 2):
+    # Real report line numbers are 1-based. If header_index is 1, first data row is 3.
+    for source_line_number, line in enumerate(lines[header_index + 1 :], start=header_index + 2):
         if line.strip() == "":
             continue
 
-        values = [value.strip() for value in line.split(delimiter)]
+        try:
+            values = [value.strip() for value in _parse_csv_line(line, delimiter)]
+        except csv.Error as error:
+            malformed_rows.append(
+                {
+                    "line_number": source_line_number,
+                    "problem": "csv_parse_error",
+                    "error": str(error),
+                    "raw_line": line,
+                }
+            )
+            continue
 
         # Remove extra blank values caused by trailing tabs/commas.
         while len(values) > len(headers) and values[-1] == "":
             values.pop()
 
+        malformed_problem = ""
+        malformed_extra_values = ""
+
         if len(values) < len(headers):
+            malformed_problem = "too_few_columns"
             values = values + [""] * (len(headers) - len(values))
 
         elif len(values) > len(headers):
-            malformed_rows.append({
-                "line_number": source_line_number,
-                "problem": "too_many_columns",
-                "extra_values": values[len(headers):],
-            })
-            values = values[:len(headers)]
+            malformed_problem = "too_many_columns"
+            malformed_extra_values = repr(values[len(headers) :])
+            values = values[: len(headers)]
 
         row = dict(zip(headers, values))
         row["_source_line_number"] = source_line_number
+        row["_malformed_problem"] = malformed_problem
+        row["_malformed_extra_values"] = malformed_extra_values
         rows.append(row)
+
+        if malformed_problem:
+            malformed_rows.append(
+                {
+                    "line_number": source_line_number,
+                    "problem": malformed_problem,
+                    "extra_values": malformed_extra_values,
+                }
+            )
 
     df = pd.DataFrame(rows)
     df.attrs["malformed_rows"] = malformed_rows
+    df.attrs["delimiter"] = "tab" if delimiter == "\t" else "comma"
     return df
 
-def add_anomaly(anomalies, row, severity, anomaly_type, description, suggested_fix):
-    anomalies.append({
-        "row_number": row.get("row_number"),
-        "location": row.get("location"),
-        "ticket_id": row.get("ticket_id"),
-        "severity": severity,
-        "anomaly_type": anomaly_type,
-        "description": description,
-        "suggested_fix": suggested_fix,
-    })
+
+def add_anomaly(
+    anomalies,
+    row,
+    severity,
+    anomaly_type,
+    description,
+    suggested_fix,
+    related_row_numbers=None,
+):
+    source_row_number = row.get("row_number")
+
+    if related_row_numbers is None:
+        related_row_numbers = [source_row_number]
+
+    cleaned_related_row_numbers = []
+
+    for row_number in related_row_numbers:
+        if pd.isna(row_number):
+            continue
+
+        try:
+            cleaned_related_row_numbers.append(int(row_number))
+        except (ValueError, TypeError):
+            cleaned_related_row_numbers.append(row_number)
+
+    anomalies.append(
+        {
+            "row_number": source_row_number,
+            "related_row_numbers": ", ".join(
+                str(row_number) for row_number in cleaned_related_row_numbers
+            ),
+            "location": row.get("location"),
+            "ticket_id": row.get("ticket_id"),
+            "severity": severity,
+            "anomaly_type": anomaly_type,
+            "description": description,
+            "suggested_fix": suggested_fix,
+        }
+    )
+
+
+def _safe_not_blank(series):
+    return series.notna() & (series.astype(str).str.strip() != "")
 
 
 def detect_anomalies(input_csv):
     df = read_parking_report(input_csv)
 
-    original_columns = [
-        col for col in list(df.columns)
-        if not str(col).startswith("_")
-    ]
+    original_columns = [col for col in list(df.columns) if not str(col).startswith("_")]
     df.columns = [normalize_column_name(col) for col in df.columns]
 
     if "source_line_number" in df.columns:
-        df["row_number"] = df["source_line_number"]
+        df["row_number"] = pd.to_numeric(df["source_line_number"], errors="coerce").astype("Int64")
     else:
         df["row_number"] = range(3, len(df) + 3)
 
@@ -195,34 +299,30 @@ def detect_anomalies(input_csv):
     amount_col = find_column(df, ["Amount"])
     duration_col = find_column(df, ["Duration(hh:mm)", "Duration", "Duration hh:mm"])
     entry_col = find_column(df, ["Entry Time", "Entry"])
-    exit_col = find_column(df, ["Exit Time", "Exit"])
     transaction_col = find_column(df, ["Transaction Time"])
     payment_status_col = find_column(df, ["Payment Status"])
     ticket_status_col = find_column(df, ["Ticket Status"])
-
+    extended_by_col = find_column(df, ["Extended By"])
+    reason_col = find_column(df, ["Reason"])
+    malformed_problem_col = find_column(df, ["_malformed_problem", "malformed_problem"])
 
     if location_col:
         df["location"] = df[location_col].astype(str).str.strip()
     else:
-        df["location"] = None
+        df["location"] = ""
 
     if ticket_col:
         df["ticket_id"] = df[ticket_col].astype(str).str.strip()
     else:
-        df["ticket_id"] = None
+        df["ticket_id"] = ""
 
-    if "ticket_id" in df.columns:
-        df["is_extension_ticket"] = (
-            df["ticket_id"]
-            .astype(str)
-            .str.upper()
-            .str.contains(r"-(?:EXT|OS|EEX)$", regex=True, na=False)
-        )
-    else:
-        df["is_extension_ticket"] = False
-
-    extended_by_col = find_column(df, ["Extended By"])
-    reason_col = find_column(df, ["Reason"])
+    # Extension/overstay/edit tickets are normal SafetyPark behavior and should not be duplicate anomalies.
+    df["is_extension_ticket"] = (
+        df["ticket_id"]
+        .astype(str)
+        .str.upper()
+        .str.contains(r"-(?:EXT|OS|EEX|EOS)$", regex=True, na=False)
+    )
 
     if extended_by_col:
         df["extended_by_clean"] = df[extended_by_col].astype(str).str.strip()
@@ -235,22 +335,19 @@ def detect_anomalies(input_csv):
     if amount_col:
         df["amount_clean"] = parse_money(df[amount_col])
     else:
-        df["amount_clean"] = None
+        df["amount_clean"] = pd.NA
 
     if duration_col:
+        df["duration_raw"] = df[duration_col].astype(str).str.strip()
         df["duration_hours"] = df[duration_col].apply(parse_duration_to_hours)
     else:
-        df["duration_hours"] = None
+        df["duration_raw"] = ""
+        df["duration_hours"] = pd.NA
 
     if entry_col:
         df["entry_time_clean"] = pd.to_datetime(df[entry_col], errors="coerce")
     else:
         df["entry_time_clean"] = pd.NaT
-
-    if exit_col:
-        df["exit_time_clean"] = pd.to_datetime(df[exit_col], errors="coerce")
-    else:
-        df["exit_time_clean"] = pd.NaT
 
     if transaction_col:
         df["transaction_time_clean"] = pd.to_datetime(df[transaction_col], errors="coerce")
@@ -269,8 +366,21 @@ def detect_anomalies(input_csv):
 
     anomalies = []
 
-    # 1. Missing location
-    for _, row in df[df["location"].isna() | (df["location"].astype(str).str.strip() == "")].iterrows():
+    # 1. Malformed rows from parsing problems. These are real data-read issues.
+    if malformed_problem_col:
+        malformed_mask = df[malformed_problem_col].astype(str).str.strip() != ""
+        for _, row in df[malformed_mask].iterrows():
+            add_anomaly(
+                anomalies,
+                row,
+                "high",
+                "malformed_row",
+                f"This row had a parsing issue: {row.get(malformed_problem_col)}.",
+                "Check whether the export row has the right number of columns or broken quoting.",
+            )
+
+    # 2. Missing location
+    for _, row in df[df["location"].astype(str).str.strip() == ""].iterrows():
         add_anomaly(
             anomalies,
             row,
@@ -280,8 +390,8 @@ def detect_anomalies(input_csv):
             "Check the original export and fill in the correct location.",
         )
 
-    # 2. Missing ticket ID
-    for _, row in df[df["ticket_id"].isna() | (df["ticket_id"].astype(str).str.strip() == "")].iterrows():
+    # 3. Missing ticket ID
+    for _, row in df[df["ticket_id"].astype(str).str.strip() == ""].iterrows():
         add_anomaly(
             anomalies,
             row,
@@ -291,21 +401,20 @@ def detect_anomalies(input_csv):
             "Check whether this transaction was exported correctly.",
         )
 
-    # 3. Duplicate ticket IDs
-    if ticket_col:
-        duplicate_mask = df["ticket_id"].notna() & df["ticket_id"].duplicated(keep=False)
-        for _, row in df[duplicate_mask].iterrows():
-            add_anomaly(
-                anomalies,
-                row,
-                "medium",
-                "duplicate_ticket_id",
-                f"Ticket ID {row['ticket_id']} appears more than once.",
-                "Check whether this is a duplicate row or a legitimate ticket update.",
-            )
+    # Duplicate ticket IDs are intentionally NOT flagged.
+    # In SafetyPark reports, repeated IDs usually represent extension, overstay, or edit rows.
+
+    # Exit-before-entry is intentionally NOT flagged.
+    # Most prior hits were parser alignment issues, and many reports have blank Exit Time.
+
+    # Dead periods are intentionally NOT flagged.
+    # Long gaps are normal for low-volume lots or off-hours.
 
     # 4. Missing or invalid entry time
     for _, row in df[df["entry_time_clean"].isna()].iterrows():
+        # Avoid spamming invalid-entry-time for already malformed rows.
+        if str(row.get("malformed_problem", "")).strip() != "":
+            continue
         add_anomaly(
             anomalies,
             row,
@@ -315,24 +424,7 @@ def detect_anomalies(input_csv):
             "Fix the entry time format or recover the value from the source system.",
         )
 
-    # 5. Exit before entry
-    exit_before_entry = (
-        df["entry_time_clean"].notna()
-        & df["exit_time_clean"].notna()
-        & (df["exit_time_clean"] < df["entry_time_clean"])
-    )
-
-    for _, row in df[exit_before_entry].iterrows():
-        add_anomaly(
-            anomalies,
-            row,
-            "high",
-            "exit_before_entry",
-            "Exit time is earlier than entry time.",
-            "Check whether entry and exit times were swapped or incorrectly recorded.",
-        )
-
-    # 6. Negative amount
+    # 5. Negative amount
     negative_amount = df["amount_clean"].notna() & (df["amount_clean"] < 0)
 
     for _, row in df[negative_amount].iterrows():
@@ -345,9 +437,11 @@ def detect_anomalies(input_csv):
             "Check whether this is a refund, correction, or data error.",
         )
 
-    # 7. Successful payment with zero or missing amount
+    # 6. Successful payment with zero or missing amount
+    # Exclude extension/edit rows because they may be legitimate adjustments.
     successful_zero_amount = (
         df["payment_status_clean"].str.contains("succeeded", na=False)
+        & (~df["is_extension_ticket"])
         & (df["amount_clean"].isna() | (df["amount_clean"] <= 0))
     )
 
@@ -358,13 +452,13 @@ def detect_anomalies(input_csv):
             "medium",
             "successful_payment_zero_amount",
             "Payment status says succeeded, but amount is missing or zero.",
-            "Check whether this was a validation ticket, free parking, or a payment export issue.",
+            "Check whether this was free parking, validation, or a payment export issue.",
         )
 
-    # 8. Weird duration values
+    # 7. Weird duration values
     if duration_col:
         weird_duration = (
-            df[duration_col].notna()
+            _safe_not_blank(df[duration_col])
             & df["duration_hours"].isna()
             & ~df[duration_col].astype(str).str.lower().str.contains("until", na=False)
         )
@@ -379,7 +473,7 @@ def detect_anomalies(input_csv):
                 "Add a parser rule for this duration format or correct the value manually.",
             )
 
-    # 9. Suspiciously long duration
+    # 8. Suspiciously long duration
     suspicious_duration = df["duration_hours"].notna() & (df["duration_hours"] > 24)
 
     for _, row in df[suspicious_duration].iterrows():
@@ -392,75 +486,47 @@ def detect_anomalies(input_csv):
             "Check whether this is a daily ticket, overnight ticket, or a bad duration value.",
         )
 
-    # 10. Same location, same hour, same duration, different prices
+    # 9. Same exact location, exact entry time, same duration, different prices.
+    # This is intentionally exact-time only, not same-hour.
     price_check = df[
-        df["location"].notna()
+        _safe_not_blank(df["location"])
         & df["entry_time_clean"].notna()
         & df["duration_hours"].notna()
         & df["amount_clean"].notna()
         & (~df["is_extension_ticket"])
     ].copy()
 
-    price_check["entry_hour"] = price_check["entry_time_clean"].dt.floor("h")
+    if not price_check.empty:
+        grouped = price_check.groupby(
+            ["location", "entry_time_clean", "duration_hours"], dropna=False
+        )["amount_clean"].nunique()
+        bad_groups = grouped[grouped > 1].reset_index()
 
-    grouped = price_check.groupby(["location", "entry_hour", "duration_hours"])["amount_clean"].nunique()
-    bad_groups = grouped[grouped > 1].reset_index()
+        for _, bad_group in bad_groups.iterrows():
+            matches = price_check[
+                (price_check["location"] == bad_group["location"])
+                & (price_check["entry_time_clean"] == bad_group["entry_time_clean"])
+                & (price_check["duration_hours"] == bad_group["duration_hours"])
+            ]
 
-    for _, bad_group in bad_groups.iterrows():
-        matches = price_check[
-            (price_check["location"] == bad_group["location"])
-            & (price_check["entry_hour"] == bad_group["entry_hour"])
-            & (price_check["duration_hours"] == bad_group["duration_hours"])
-        ]
+            related_rows = matches["row_number"].tolist()
 
-        for _, row in matches.iterrows():
-            add_anomaly(
-                anomalies,
-                row,
-                "high",
-                "same_time_duration_different_prices",
-                (
-                    f"Same location, same entry hour, and same duration have multiple prices. "
-                    f"Location: {row['location']}, hour: {row['entry_hour']}, duration: {row['duration_hours']}."
-                ),
-                "Check whether the pricing rules changed mid-hour or whether one of the prices is incorrect.",
-            )
+            for _, row in matches.iterrows():
+                add_anomaly(
+                    anomalies,
+                    row,
+                    "high",
+                    "same_exact_time_duration_different_prices",
+                    (
+                        "Same location, exact entry time, and same duration have multiple prices. "
+                        f"Location: {row['location']}, entry time: {row['entry_time_clean']}, "
+                        f"duration: {row['duration_hours']}."
+                    ),
+                    "Check whether one of the prices is incorrect or whether these records represent a special case.",
+                    related_row_numbers=related_rows,
+                )
 
-    # 11. Dead periods of 4+ hours with no entries
-    entry_rows = df[df["entry_time_clean"].notna() & df["location"].notna()].copy()
-    entry_rows = entry_rows.sort_values(["location", "entry_time_clean"])
-
-    for location, group in entry_rows.groupby("location"):
-        group = group.sort_values("entry_time_clean")
-        time_diffs = group["entry_time_clean"].diff()
-
-        dead_periods = group[time_diffs > pd.Timedelta(hours=4)]
-
-        for idx, row in dead_periods.iterrows():
-            previous_time = group.loc[group.index[group.index.get_loc(idx) - 1], "entry_time_clean"]
-
-            add_anomaly(
-                anomalies,
-                row,
-                "low",
-                "dead_period_over_4_hours",
-                (
-                    f"No recorded entries at {location} for more than 4 hours. "
-                    f"Previous entry: {previous_time}. Next entry: {row['entry_time_clean']}."
-                ),
-                "Check whether this was truly a dead period or whether data is missing.",
-            )
-
-    anomaly_columns = [
-        "row_number",
-        "location",
-        "ticket_id",
-        "severity",
-        "anomaly_type",
-        "description",
-        "suggested_fix",
-    ]
-    anomaly_df = pd.DataFrame(anomalies, columns=anomaly_columns)
+    anomaly_df = pd.DataFrame(anomalies, columns=ANOMALY_COLUMNS)
 
     return anomaly_df, original_columns
 
@@ -481,6 +547,7 @@ def main():
 
     print("Parking Data Anomaly Detector")
     print("=============================")
+    print(f"Detector version: {DETECTOR_VERSION}")
     print(f"Input file: {args.input}")
     print(f"Output file: {args.output}")
     print()
@@ -499,4 +566,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
